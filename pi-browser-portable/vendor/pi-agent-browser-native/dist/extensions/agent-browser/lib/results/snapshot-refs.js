@@ -1,0 +1,83 @@
+import { isRecord } from "../parsing.js";
+import { getEditableRefEvidence } from "./editable-ref-evidence.js";
+import { compareRefIds, normalizeWhitespace } from "./text.js";
+/** Project native delta full responses onto the ordinary snapshot shape for local readers. */
+export function getFullSnapshotData(data) {
+    if (!isRecord(data))
+        return undefined;
+    if (!isRecord(data.snapshot))
+        return data;
+    return data.snapshot.kind === "full"
+        ? { ...data, snapshot: data.snapshot.tree, refs: data.snapshot.refs }
+        : undefined;
+}
+export function getSnapshotRefRecord(data) {
+    const full = getFullSnapshotData(data);
+    return full && isRecord(full.refs) ? full.refs : undefined;
+}
+export function getSnapshotLineTextByRef(data) {
+    const full = getFullSnapshotData(data);
+    const snapshot = typeof full?.snapshot === "string" ? full.snapshot : "";
+    const lineByRef = new Map();
+    for (const line of snapshot.split("\n")) {
+        const ref = line.match(/\bref=([^,\]\s]+)/)?.[1];
+        if (!ref || lineByRef.has(ref))
+            continue;
+        lineByRef.set(ref, line);
+    }
+    return lineByRef;
+}
+export function getSnapshotRefEntries(data) {
+    const refs = getSnapshotRefRecord(data);
+    if (!refs)
+        return [];
+    return Object.entries(refs)
+        .map(([id, value]) => {
+        if (!isRecord(value)) {
+            return { id, name: "", role: "unknown" };
+        }
+        const name = typeof value.name === "string" ? normalizeWhitespace(value.name) : "";
+        const role = typeof value.role === "string" && value.role.length > 0 ? value.role : "unknown";
+        const isEditable = getEditableRefEvidence({ ref: value });
+        return { id, isEditable, name, refData: value, role };
+    })
+        .sort((a, b) => compareRefIds(a.id, b.id));
+}
+function isEditableSnapshotLine(line) {
+    const editableEvidence = getEditableRefEvidence({ text: line.raw });
+    if (editableEvidence !== undefined)
+        return editableEvidence;
+    return line.role === "searchbox" || line.role === "textbox" || line.role === "combobox" ? true : undefined;
+}
+export function getSnapshotRefRole(entry, editableEvidence) {
+    const rawRole = typeof entry.role === "string" && entry.role.length > 0 ? entry.role : "unknown";
+    const normalizedRole = rawRole.toLowerCase();
+    if ((normalizedRole === "generic" || normalizedRole === "unknown") && editableEvidence === true) {
+        return "textbox";
+    }
+    return rawRole;
+}
+export function enrichSnapshotRefEntries(refEntries, snapshotLines) {
+    const lineByRef = new Map();
+    for (const line of snapshotLines) {
+        if (!line.ref || lineByRef.has(line.ref))
+            continue;
+        lineByRef.set(line.ref, line);
+    }
+    return refEntries.map((entry) => {
+        const line = lineByRef.get(entry.id);
+        const lineRole = line && line.role !== "unknown" ? line.role : undefined;
+        const editableEvidence = getEditableRefEvidence({ ref: entry.refData, text: line?.raw });
+        const hasEditableRole = line ? isEditableSnapshotLine(line) === true && !["unknown", "generic"].includes(line.role) : false;
+        const isEditable = editableEvidence === true || (editableEvidence !== false && hasEditableRole);
+        const roleFromRefOrLine = entry.role !== "unknown" && entry.role !== "generic" ? entry.role : lineRole ?? entry.role;
+        const role = getSnapshotRefRole({ role: roleFromRefOrLine }, isEditable);
+        return {
+            ...entry,
+            isEditable,
+            lineIndex: line?.index,
+            name: entry.name.length > 0 ? entry.name : (line?.name ?? ""),
+            role,
+        };
+    });
+}

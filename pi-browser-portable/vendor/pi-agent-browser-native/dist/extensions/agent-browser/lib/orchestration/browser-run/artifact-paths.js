@@ -1,0 +1,136 @@
+import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { foldAgentBrowserFilesystemIdentity } from "../../argv-grammar.js";
+import { parseWaitCommandTokens } from "../../argv-descriptor.js";
+import { getRecordCommandOperandIndices, getRecordCommandOperands } from "../../command-taxonomy.js";
+const SCREENSHOT_IMAGE_EXTENSIONS = [".jpeg", ".jpg", ".png", ".webp"];
+function isSingleScreenshotPathToken(token) {
+    const explicitlyRelative = token.startsWith("./") || token.startsWith("../");
+    if (token.startsWith("#") || token.startsWith("@") || (token.startsWith(".") && !explicitlyRelative && !token.includes("/")))
+        return false;
+    return explicitlyRelative || token.includes("/") || SCREENSHOT_IMAGE_EXTENSIONS.some((extension) => token.endsWith(extension));
+}
+export function getScreenshotPositionalIndices(commandTokens) {
+    if (commandTokens[0] !== "screenshot")
+        return [];
+    const positionalIndices = [];
+    for (let index = 1; index < commandTokens.length; index += 1) {
+        const token = commandTokens[index];
+        if (token === "--full" || token === "-f" || token === "--if-changed")
+            continue;
+        if (token === "--threshold") {
+            index += 1;
+            continue;
+        }
+        positionalIndices.push(index);
+    }
+    return positionalIndices;
+}
+export function getScreenshotPathTokenIndex(commandTokens) {
+    const positionalIndices = getScreenshotPositionalIndices(commandTokens);
+    if (positionalIndices.length === 0)
+        return undefined;
+    const candidateIndex = positionalIndices.length >= 2 ? positionalIndices[1] : positionalIndices[0];
+    const candidate = commandTokens[candidateIndex];
+    if (positionalIndices.length >= 2 || isSingleScreenshotPathToken(candidate)) {
+        return candidateIndex;
+    }
+    return undefined;
+}
+const DIFF_SCREENSHOT_VALUE_FLAGS = new Set(["-b", "--baseline", "-o", "--output", "-s", "--selector", "-t", "--threshold"]);
+export function getDiffFilePathIndices(commandTokens) {
+    if (commandTokens[0] !== "diff" || !["snapshot", "screenshot"].includes(commandTokens[1]))
+        return {};
+    const valueFlags = commandTokens[1] === "screenshot" ? DIFF_SCREENSHOT_VALUE_FLAGS : new Set(["-b", "--baseline", "-s", "--selector", "-d", "--depth"]);
+    const paths = {};
+    for (let index = 2; index < commandTokens.length; index += 1) {
+        const token = commandTokens[index];
+        if (!valueFlags.has(token))
+            continue;
+        const value = commandTokens[index + 1];
+        if (value === undefined)
+            return {};
+        if (token === "-o" || token === "--output")
+            paths.output = index + 1;
+        if (token === "-b" || token === "--baseline")
+            paths.baseline = index + 1;
+        index += 1;
+    }
+    return paths;
+}
+function canonicalizeArtifactPath(absolutePath, platform, seenSymlinks) {
+    let cursor = absolutePath;
+    const suffix = [];
+    while (true) {
+        try {
+            const canonicalPath = join(realpathSync.native(cursor), ...suffix);
+            try {
+                const stats = statSync(canonicalPath, { bigint: true });
+                if (stats.ino > 0n)
+                    return `inode:${stats.dev}:${stats.ino}`;
+            }
+            catch {
+                // The destination does not exist yet; canonical ancestry still catches aliases.
+            }
+            return foldAgentBrowserFilesystemIdentity(canonicalPath, platform);
+        }
+        catch {
+            let symlinkTarget;
+            try {
+                if (lstatSync(cursor).isSymbolicLink())
+                    symlinkTarget = resolve(dirname(cursor), readlinkSync(cursor));
+            }
+            catch { }
+            if (symlinkTarget) {
+                if (seenSymlinks.has(cursor))
+                    throw new Error(`Artifact destination contains a symlink loop: ${absolutePath}`);
+                if (seenSymlinks.size >= 32)
+                    throw new Error(`Artifact destination has too many symlink hops: ${absolutePath}`);
+                seenSymlinks.add(cursor);
+                return canonicalizeArtifactPath(join(symlinkTarget, ...suffix), platform, seenSymlinks);
+            }
+            const parent = dirname(cursor);
+            if (parent === cursor)
+                return foldAgentBrowserFilesystemIdentity(absolutePath, platform);
+            suffix.unshift(basename(cursor));
+            cursor = parent;
+        }
+    }
+}
+export function canonicalizeExplicitArtifactDestination(cwd, destination, platform = process.platform) {
+    return canonicalizeArtifactPath(resolve(cwd, destination), platform, new Set());
+}
+export function getRecordContactSheetDestination(commandTokens) {
+    const path = getRecordCommandOperands(commandTokens).path;
+    if (!path || !commandTokens.some((token) => token === "--contact-sheet" || token === "--contact-sheet-threshold"))
+        return undefined;
+    const extension = extname(path);
+    return extension ? `${path.slice(0, -extension.length)}.contact-sheet.png` : undefined;
+}
+export function getExplicitArtifactDestinationIndex(commandTokens) {
+    const command = commandTokens[0];
+    const subcommand = commandTokens[1];
+    if (command === "screenshot")
+        return getScreenshotPathTokenIndex(commandTokens);
+    if (command === "download")
+        return 2;
+    if (command === "pdf")
+        return 1;
+    if (command === "wait")
+        return parseWaitCommandTokens(commandTokens).downloadPathIndex;
+    if (command === "state" && subcommand === "save")
+        return 2;
+    if (command === "diff" && subcommand === "screenshot")
+        return getDiffFilePathIndices(commandTokens).output;
+    if (command === "network" && subcommand === "har" && commandTokens[2] === "stop")
+        return 3;
+    if ((command === "trace" || command === "profiler") && subcommand === "stop")
+        return 2;
+    if (command === "record")
+        return getRecordCommandOperandIndices(commandTokens)[0];
+    return undefined;
+}
+export function getExplicitArtifactDestination(commandTokens) {
+    const index = getExplicitArtifactDestinationIndex(commandTokens);
+    return index === undefined ? undefined : commandTokens[index];
+}

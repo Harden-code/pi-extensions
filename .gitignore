@@ -1,0 +1,10 @@
+.DS_Store
+node_modules/
+*.log
+browser-check/
+mac-computer-control/bin/
+.pi/
+.env
+.env.*
+*.pem
+*.key
